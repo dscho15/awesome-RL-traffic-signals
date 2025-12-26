@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -13,10 +14,18 @@
 
 namespace {
 
+struct TrafficLightConfig {
+  std::string id;
+  std::string phaseMap;
+  bool optimize = false;
+  bool optimizeSet = false;
+};
+
 struct Options {
   std::string sumoConfig;
   std::string trafficLightId;
   std::string phaseMap;
+  std::vector<TrafficLightConfig> trafficLights;
   bool gui = false;
   int stepLength = 1;
   int phaseDuration = 10;
@@ -31,6 +40,7 @@ struct OptionFlags {
   bool sumoConfig = false;
   bool trafficLightId = false;
   bool phaseMap = false;
+  bool trafficLights = false;
   bool gui = false;
   bool stepLength = false;
   bool phaseDuration = false;
@@ -116,9 +126,31 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
   }
 
   std::string line;
+  bool inTrafficLights = false;
+  bool hasCurrentTrafficLight = false;
+  TrafficLightConfig currentTrafficLight;
+  auto finalizeTrafficLight = [&]() {
+    if (!hasCurrentTrafficLight) {
+      return;
+    }
+    if (!currentTrafficLight.id.empty() || !currentTrafficLight.phaseMap.empty()) {
+      options.trafficLights.push_back(currentTrafficLight);
+      flags.trafficLights = true;
+    }
+    currentTrafficLight = TrafficLightConfig{};
+    hasCurrentTrafficLight = false;
+  };
+
   while (std::getline(file, line)) {
+    std::string rawLine = line;
     line = trim(line);
     if (line.empty() || line.rfind('#', 0) == 0) {
+      continue;
+    }
+
+    if (line.rfind("traffic_lights", 0) == 0 && line.find(':') != std::string::npos) {
+      finalizeTrafficLight();
+      inTrafficLights = true;
       continue;
     }
 
@@ -129,6 +161,54 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
 
     std::string key = trim(line.substr(0, pos));
     std::string value = trim(stripInlineComment(line.substr(pos + 1)));
+    if (inTrafficLights) {
+      if (line.rfind('-', 0) == 0) {
+        finalizeTrafficLight();
+        hasCurrentTrafficLight = true;
+        std::string remainder = trim(line.substr(1));
+        if (!remainder.empty()) {
+          auto itemPos = remainder.find(':');
+          if (itemPos != std::string::npos) {
+            std::string itemKey = trim(remainder.substr(0, itemPos));
+            std::string itemValue = trim(stripInlineComment(remainder.substr(itemPos + 1)));
+            if (!itemValue.empty() && itemValue.front() == '"' && itemValue.back() == '"') {
+              itemValue = itemValue.substr(1, itemValue.size() - 2);
+            }
+            if (itemKey == "id" || itemKey == "traffic_light_id") {
+              currentTrafficLight.id = itemValue;
+            } else if (itemKey == "phase_map") {
+              currentTrafficLight.phaseMap = itemValue;
+            } else if (itemKey == "optimize") {
+              currentTrafficLight.optimize = parseBool(itemValue);
+              currentTrafficLight.optimizeSet = true;
+            }
+          }
+        }
+        continue;
+      }
+
+      if (key == "id" || key == "traffic_light_id" || key == "phase_map" || key == "optimize") {
+        if (!hasCurrentTrafficLight) {
+          hasCurrentTrafficLight = true;
+        }
+        if (!value.empty() && value.front() == '"' && value.back() == '"') {
+          value = value.substr(1, value.size() - 2);
+        }
+        if (key == "id" || key == "traffic_light_id") {
+          currentTrafficLight.id = value;
+        } else if (key == "phase_map") {
+          currentTrafficLight.phaseMap = value;
+        } else if (key == "optimize") {
+          currentTrafficLight.optimize = parseBool(value);
+          currentTrafficLight.optimizeSet = true;
+        }
+        continue;
+      }
+
+      finalizeTrafficLight();
+      inTrafficLights = false;
+    }
+
     if (value.empty()) {
       std::cerr << "Empty value for key: " << key << "\n";
       continue;
@@ -147,6 +227,8 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
       } else if (key == "phase_map") {
         options.phaseMap = value;
         flags.phaseMap = true;
+      } else if (key == "traffic_lights") {
+        flags.trafficLights = true;
       } else if (key == "gui") {
         options.gui = parseBool(value);
         flags.gui = true;
@@ -178,6 +260,7 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
     }
   }
 
+  finalizeTrafficLight();
   return options;
 }
 
@@ -196,8 +279,14 @@ void printUsage() {
   std::cout
       << "Usage: auction_tsc --sumo-config <cfg.sumocfg> --tl-id <traffic_light_id> --phase-map "
          "\"0:laneA,laneB;1:laneC,laneD\" [options]\n"
+         "       auction_tsc --sumo-config <cfg.sumocfg> --tl-id <id1> --phase-map "
+         "\"0:laneA,laneB\" --tl-id <id2> --phase-map \"0:laneC\" [options]\n"
+         "       auction_tsc --sumo-config <cfg.sumocfg> --phase-map \"tl1:0:laneA\" "
+         "--phase-map \"tl2:0:laneB\" [options]\n"
          "Options:\n"
          "  --config <file.yaml>         Load options from a yaml file\n"
+         "  --tl-id <id>                 Traffic light id (repeatable)\n"
+         "  --phase-map <map>            Phase map (repeatable, supports tl_id:phase_map)\n"
          "  --gui                       Run with sumo-gui\n"
          "  --step-length <seconds>      Simulation step length (default: 1)\n"
          "  --phase-duration <seconds>   Duration to hold a phase (default: 10)\n"
@@ -214,12 +303,8 @@ bool validateOptions(const Options& options) {
     std::cerr << "Missing required --sumo-config.\n";
     ok = false;
   }
-  if (options.trafficLightId.empty()) {
-    std::cerr << "Missing required --tl-id.\n";
-    ok = false;
-  }
-  if (options.phaseMap.empty()) {
-    std::cerr << "Missing required --phase-map.\n";
+  if (options.trafficLights.empty()) {
+    std::cerr << "Missing required traffic light configuration. Provide --tl-id and --phase-map.\n";
     ok = false;
   }
   if (options.stepLength <= 0) {
@@ -244,7 +329,22 @@ bool validateOptions(const Options& options) {
       ok = false;
     }
   }
+  for (const auto& trafficLight : options.trafficLights) {
+    if (trafficLight.id.empty()) {
+      std::cerr << "Traffic light entry missing id.\n";
+      ok = false;
+    }
+    if (trafficLight.phaseMap.empty()) {
+      std::cerr << "Traffic light entry missing phase map for id: " << trafficLight.id << "\n";
+      ok = false;
+    }
+  }
   return ok;
+}
+
+bool isAllDigits(const std::string& value) {
+  return !value.empty() &&
+         std::all_of(value.begin(), value.end(), [](unsigned char ch) { return std::isdigit(ch); });
 }
 
 Options parseArgs(int argc, char** argv) {
@@ -262,6 +362,9 @@ Options parseArgs(int argc, char** argv) {
     Options yamlOptions = loadYamlConfig(configPath, yamlFlags);
     if (yamlFlags.sumoConfig) {
       options.sumoConfig = yamlOptions.sumoConfig;
+    }
+    if (yamlFlags.trafficLights) {
+      options.trafficLights = yamlOptions.trafficLights;
     }
     if (yamlFlags.trafficLightId) {
       options.trafficLightId = yamlOptions.trafficLightId;
@@ -295,14 +398,45 @@ Options parseArgs(int argc, char** argv) {
     }
   }
 
+  auto assignPhaseMap = [&](const std::string& mapValue) {
+    auto pos = mapValue.find(':');
+    if (pos != std::string::npos) {
+      std::string prefix = mapValue.substr(0, pos);
+      auto existing = std::find_if(options.trafficLights.begin(),
+                                   options.trafficLights.end(),
+                                   [&](const TrafficLightConfig& entry) {
+                                     return entry.id == prefix;
+                                   });
+      if (existing != options.trafficLights.end()) {
+        existing->phaseMap = mapValue.substr(pos + 1);
+        return;
+      }
+      if (!isAllDigits(prefix)) {
+        options.trafficLights.push_back(
+            TrafficLightConfig{prefix, mapValue.substr(pos + 1), options.optimize});
+        return;
+      }
+    }
+
+    for (auto it = options.trafficLights.rbegin(); it != options.trafficLights.rend(); ++it) {
+      if (it->phaseMap.empty()) {
+        it->phaseMap = mapValue;
+        return;
+      }
+    }
+
+    options.phaseMap = mapValue;
+  };
+
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--sumo-config" && i + 1 < argc) {
       options.sumoConfig = argv[++i];
     } else if (arg == "--tl-id" && i + 1 < argc) {
-      options.trafficLightId = argv[++i];
+      options.trafficLights.push_back(
+          TrafficLightConfig{argv[++i], std::string{}, options.optimize});
     } else if (arg == "--phase-map" && i + 1 < argc) {
-      options.phaseMap = argv[++i];
+      assignPhaseMap(argv[++i]);
     } else if (arg == "--gui") {
       options.gui = true;
     } else if (arg == "--step-length" && i + 1 < argc) {
@@ -319,6 +453,17 @@ Options parseArgs(int argc, char** argv) {
       options.optimizeWindow = std::stoi(argv[++i]);
     } else if (arg == "--optimize-delta" && i + 1 < argc) {
       options.optimizeDelta = std::stod(argv[++i]);
+    }
+  }
+
+  if (!options.trafficLightId.empty() || !options.phaseMap.empty()) {
+    options.trafficLights.push_back(
+        TrafficLightConfig{options.trafficLightId, options.phaseMap, options.optimize});
+  }
+
+  for (auto& trafficLight : options.trafficLights) {
+    if (!trafficLight.optimizeSet) {
+      trafficLight.optimize = options.optimize;
     }
   }
   return options;
@@ -403,12 +548,35 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto phaseGroups = parsePhaseMap(options.phaseMap);
-  if (phaseGroups.empty()) {
-    std::cerr << "Invalid --phase-map. Provide at least one phase mapping.\n";
-    return 1;
+  struct ControllerState {
+    AuctionController controller;
+    std::optional<SimpleOptimizer> optimizer;
+    bool optimizeEnabled = false;
+  };
+
+  std::vector<ControllerState> controllers;
+  controllers.reserve(options.trafficLights.size());
+  for (const auto& trafficLight : options.trafficLights) {
+    auto phaseGroups = parsePhaseMap(trafficLight.phaseMap);
+    if (phaseGroups.empty()) {
+      std::cerr << "Invalid --phase-map for traffic light '" << trafficLight.id
+                << "'. Provide at least one phase mapping.\n";
+      return 1;
+    }
+
+    auto phaseGroupsForOptimizer = phaseGroups;
+    controllers.push_back(ControllerState{
+        AuctionController(trafficLight.id,
+                          std::move(phaseGroups),
+                          AuctionWeights{options.queueWeight, options.waitWeight},
+                          options.phaseDuration),
+        std::nullopt,
+        trafficLight.optimize});
+    if (trafficLight.optimize) {
+      controllers.back().optimizer = SimpleOptimizer(
+          std::move(phaseGroupsForOptimizer), options.optimizeWindow, options.optimizeDelta);
+    }
   }
-  auto phaseGroupsForOptimizer = phaseGroups;
 
   std::vector<std::string> sumoCmd = {options.gui ? "sumo-gui" : "sumo",
                                       "-c",
@@ -419,24 +587,22 @@ int main(int argc, char** argv) {
 
   libtraci::start(sumoCmd);
 
-  AuctionController controller(options.trafficLightId,
-                               std::move(phaseGroups),
-                               AuctionWeights{options.queueWeight, options.waitWeight},
-                               options.phaseDuration);
-
-  SimpleOptimizer optimizer(phaseGroupsForOptimizer, options.optimizeWindow, options.optimizeDelta);
   int stepIndex = 0;
-  if (options.optimize) {
-    optimizer.initialize(controller.weights(), stepIndex);
+  for (auto& state : controllers) {
+    if (state.optimizeEnabled && state.optimizer) {
+      state.optimizer->initialize(state.controller.weights(), stepIndex);
+    }
   }
 
   while (libtraci::simulation::getMinExpectedNumber() > 0) {
     libtraci::simulation::step();
     int currentTime = static_cast<int>(libtraci::simulation::getTime());
-    if (options.optimize) {
-      optimizer.step(stepIndex, controller);
+    for (auto& state : controllers) {
+      if (state.optimizeEnabled && state.optimizer) {
+        state.optimizer->step(stepIndex, state.controller);
+      }
+      state.controller.applyPhaseIfDue(currentTime);
     }
-    controller.applyPhaseIfDue(currentTime);
     ++stepIndex;
   }
 
