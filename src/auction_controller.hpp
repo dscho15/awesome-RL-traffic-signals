@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct PhaseBidGroup {
@@ -11,6 +12,7 @@ struct PhaseBidGroup {
 struct AuctionWeights {
   double queueWeight;
   double waitWeight;
+  double agingWeight;
 };
 
 class AuctionController {
@@ -34,4 +36,7 @@ class AuctionController {
   AuctionWeights weights_;
   int phaseDurationSeconds_;
   int lastPhaseChangeStep_;
+  int lastAgingUpdateStep_;
+  int currentPhase_;
+  std::unordered_map<int, int> timeSinceServedByPhase_;
 };

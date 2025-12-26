@@ -22,6 +22,7 @@ struct Options {
   int phaseDuration = 10;
   double queueWeight = 1.0;
   double waitWeight = 0.05;
+  double agingWeight = 0.0;
   bool optimize = false;
   int optimizeWindow = 60;
   double optimizeDelta = 0.2;
@@ -36,6 +37,7 @@ struct OptionFlags {
   bool phaseDuration = false;
   bool queueWeight = false;
   bool waitWeight = false;
+  bool agingWeight = false;
   bool optimize = false;
   bool optimizeWindow = false;
   bool optimizeDelta = false;
@@ -162,6 +164,9 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
       } else if (key == "wait_weight") {
         options.waitWeight = std::stod(value);
         flags.waitWeight = true;
+      } else if (key == "aging_weight") {
+        options.agingWeight = std::stod(value);
+        flags.agingWeight = true;
       } else if (key == "optimize") {
         options.optimize = parseBool(value);
         flags.optimize = true;
@@ -203,6 +208,7 @@ void printUsage() {
          "  --phase-duration <seconds>   Duration to hold a phase (default: 10)\n"
          "  --queue-weight <float>       Weight for queue length (default: 1.0)\n"
          "  --wait-weight <float>        Weight for waiting time (default: 0.05)\n"
+         "  --aging-weight <float>       Weight for phase aging term (default: 0.0)\n"
          "  --optimize                   Enable simple weight tuning\n"
          "  --optimize-window <steps>    Steps to evaluate each candidate (default: 60)\n"
          "  --optimize-delta <float>     Weight adjustment step (default: 0.2)\n";
@@ -232,6 +238,10 @@ bool validateOptions(const Options& options) {
   }
   if (options.queueWeight < 0.0 || options.waitWeight < 0.0) {
     std::cerr << "Weights must be non-negative.\n";
+    ok = false;
+  }
+  if (options.agingWeight < 0.0) {
+    std::cerr << "--aging-weight must be non-negative.\n";
     ok = false;
   }
   if (options.optimize) {
@@ -284,6 +294,9 @@ Options parseArgs(int argc, char** argv) {
     if (yamlFlags.waitWeight) {
       options.waitWeight = yamlOptions.waitWeight;
     }
+    if (yamlFlags.agingWeight) {
+      options.agingWeight = yamlOptions.agingWeight;
+    }
     if (yamlFlags.optimize) {
       options.optimize = yamlOptions.optimize;
     }
@@ -313,6 +326,8 @@ Options parseArgs(int argc, char** argv) {
       options.queueWeight = std::stod(argv[++i]);
     } else if (arg == "--wait-weight" && i + 1 < argc) {
       options.waitWeight = std::stod(argv[++i]);
+    } else if (arg == "--aging-weight" && i + 1 < argc) {
+      options.agingWeight = std::stod(argv[++i]);
     } else if (arg == "--optimize") {
       options.optimize = true;
     } else if (arg == "--optimize-window" && i + 1 < argc) {
@@ -333,7 +348,7 @@ class SimpleOptimizer {
         lastWindowStep_(0),
         bestObjective_(std::numeric_limits<double>::infinity()),
         candidateIndex_(0),
-        lastWeights_({1.0, 0.05}),
+        lastWeights_({1.0, 0.05, 0.0}),
         usingCandidate_(false) {}
 
   void initialize(const AuctionWeights& weights, int currentStep) {
@@ -421,7 +436,8 @@ int main(int argc, char** argv) {
 
   AuctionController controller(options.trafficLightId,
                                std::move(phaseGroups),
-                               AuctionWeights{options.queueWeight, options.waitWeight},
+                               AuctionWeights{options.queueWeight, options.waitWeight,
+                                              options.agingWeight},
                                options.phaseDuration);
 
   SimpleOptimizer optimizer(phaseGroupsForOptimizer, options.optimizeWindow, options.optimizeDelta);
