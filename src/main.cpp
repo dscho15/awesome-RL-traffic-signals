@@ -16,10 +16,15 @@ namespace {
 struct Options {
   std::string sumoConfig;
   std::string trafficLightId;
+  std::string programId;
   std::string phaseMap;
   bool gui = false;
   int stepLength = 1;
   int phaseDuration = 10;
+  int minGreen = -1;
+  int maxGreen = -1;
+  int yellowDuration = 3;
+  int allRedDuration = 1;
   double queueWeight = 1.0;
   double waitWeight = 0.05;
   bool optimize = false;
@@ -30,10 +35,15 @@ struct Options {
 struct OptionFlags {
   bool sumoConfig = false;
   bool trafficLightId = false;
+  bool programId = false;
   bool phaseMap = false;
   bool gui = false;
   bool stepLength = false;
   bool phaseDuration = false;
+  bool minGreen = false;
+  bool maxGreen = false;
+  bool yellowDuration = false;
+  bool allRedDuration = false;
   bool queueWeight = false;
   bool waitWeight = false;
   bool optimize = false;
@@ -85,7 +95,12 @@ std::string stripInlineComment(const std::string& value) {
   return value;
 }
 
-std::vector<PhaseBidGroup> parsePhaseMap(const std::string& mapping) {
+bool isGreenPhase(const std::string& state) {
+  return state.find('G') != std::string::npos || state.find('g') != std::string::npos;
+}
+
+std::vector<PhaseBidGroup> parsePhaseMap(const std::string& mapping,
+                                         const std::vector<std::string>& programPhases) {
   std::vector<PhaseBidGroup> groups;
   if (mapping.empty()) {
     return groups;
@@ -98,6 +113,16 @@ std::vector<PhaseBidGroup> parsePhaseMap(const std::string& mapping) {
     }
 
     int phaseIndex = std::stoi(parts[0]);
+    if (!programPhases.empty()) {
+      if (phaseIndex < 0 || phaseIndex >= static_cast<int>(programPhases.size())) {
+        std::cerr << "Phase index " << phaseIndex << " not available in program.\n";
+        continue;
+      }
+      if (!isGreenPhase(programPhases[phaseIndex])) {
+        std::cerr << "Phase index " << phaseIndex << " is not a green phase in the program.\n";
+        continue;
+      }
+    }
     auto lanes = split(parts[1], ',');
     if (!lanes.empty()) {
       groups.push_back(PhaseBidGroup{phaseIndex, lanes});
@@ -144,6 +169,9 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
       } else if (key == "traffic_light_id") {
         options.trafficLightId = value;
         flags.trafficLightId = true;
+      } else if (key == "tls_program") {
+        options.programId = value;
+        flags.programId = true;
       } else if (key == "phase_map") {
         options.phaseMap = value;
         flags.phaseMap = true;
@@ -156,6 +184,18 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
       } else if (key == "phase_duration") {
         options.phaseDuration = std::stoi(value);
         flags.phaseDuration = true;
+      } else if (key == "min_green") {
+        options.minGreen = std::stoi(value);
+        flags.minGreen = true;
+      } else if (key == "max_green") {
+        options.maxGreen = std::stoi(value);
+        flags.maxGreen = true;
+      } else if (key == "yellow_duration") {
+        options.yellowDuration = std::stoi(value);
+        flags.yellowDuration = true;
+      } else if (key == "all_red_duration") {
+        options.allRedDuration = std::stoi(value);
+        flags.allRedDuration = true;
       } else if (key == "queue_weight") {
         options.queueWeight = std::stod(value);
         flags.queueWeight = true;
@@ -198,9 +238,14 @@ void printUsage() {
          "\"0:laneA,laneB;1:laneC,laneD\" [options]\n"
          "Options:\n"
          "  --config <file.yaml>         Load options from a yaml file\n"
+         "  --tls-program <program_id>   SUMO traffic light program id (default: current)\n"
          "  --gui                       Run with sumo-gui\n"
          "  --step-length <seconds>      Simulation step length (default: 1)\n"
          "  --phase-duration <seconds>   Duration to hold a phase (default: 10)\n"
+         "  --min-green <seconds>        Minimum green duration (default: phase-duration)\n"
+         "  --max-green <seconds>        Maximum green duration (default: 2x phase-duration)\n"
+         "  --yellow-duration <seconds>  Yellow transition duration (default: 3)\n"
+         "  --all-red-duration <seconds> All-red transition duration (default: 1)\n"
          "  --queue-weight <float>       Weight for queue length (default: 1.0)\n"
          "  --wait-weight <float>        Weight for waiting time (default: 0.05)\n"
          "  --optimize                   Enable simple weight tuning\n"
@@ -228,6 +273,22 @@ bool validateOptions(const Options& options) {
   }
   if (options.phaseDuration <= 0) {
     std::cerr << "--phase-duration must be positive.\n";
+    ok = false;
+  }
+  if (options.minGreen <= 0) {
+    std::cerr << "--min-green must be positive.\n";
+    ok = false;
+  }
+  if (options.maxGreen <= 0) {
+    std::cerr << "--max-green must be positive.\n";
+    ok = false;
+  }
+  if (options.maxGreen < options.minGreen) {
+    std::cerr << "--max-green must be >= --min-green.\n";
+    ok = false;
+  }
+  if (options.yellowDuration < 0 || options.allRedDuration < 0) {
+    std::cerr << "--yellow-duration and --all-red-duration must be non-negative.\n";
     ok = false;
   }
   if (options.queueWeight < 0.0 || options.waitWeight < 0.0) {
@@ -266,6 +327,9 @@ Options parseArgs(int argc, char** argv) {
     if (yamlFlags.trafficLightId) {
       options.trafficLightId = yamlOptions.trafficLightId;
     }
+    if (yamlFlags.programId) {
+      options.programId = yamlOptions.programId;
+    }
     if (yamlFlags.phaseMap) {
       options.phaseMap = yamlOptions.phaseMap;
     }
@@ -277,6 +341,18 @@ Options parseArgs(int argc, char** argv) {
     }
     if (yamlFlags.phaseDuration) {
       options.phaseDuration = yamlOptions.phaseDuration;
+    }
+    if (yamlFlags.minGreen) {
+      options.minGreen = yamlOptions.minGreen;
+    }
+    if (yamlFlags.maxGreen) {
+      options.maxGreen = yamlOptions.maxGreen;
+    }
+    if (yamlFlags.yellowDuration) {
+      options.yellowDuration = yamlOptions.yellowDuration;
+    }
+    if (yamlFlags.allRedDuration) {
+      options.allRedDuration = yamlOptions.allRedDuration;
     }
     if (yamlFlags.queueWeight) {
       options.queueWeight = yamlOptions.queueWeight;
@@ -301,6 +377,8 @@ Options parseArgs(int argc, char** argv) {
       options.sumoConfig = argv[++i];
     } else if (arg == "--tl-id" && i + 1 < argc) {
       options.trafficLightId = argv[++i];
+    } else if (arg == "--tls-program" && i + 1 < argc) {
+      options.programId = argv[++i];
     } else if (arg == "--phase-map" && i + 1 < argc) {
       options.phaseMap = argv[++i];
     } else if (arg == "--gui") {
@@ -309,6 +387,14 @@ Options parseArgs(int argc, char** argv) {
       options.stepLength = std::stoi(argv[++i]);
     } else if (arg == "--phase-duration" && i + 1 < argc) {
       options.phaseDuration = std::stoi(argv[++i]);
+    } else if (arg == "--min-green" && i + 1 < argc) {
+      options.minGreen = std::stoi(argv[++i]);
+    } else if (arg == "--max-green" && i + 1 < argc) {
+      options.maxGreen = std::stoi(argv[++i]);
+    } else if (arg == "--yellow-duration" && i + 1 < argc) {
+      options.yellowDuration = std::stoi(argv[++i]);
+    } else if (arg == "--all-red-duration" && i + 1 < argc) {
+      options.allRedDuration = std::stoi(argv[++i]);
     } else if (arg == "--queue-weight" && i + 1 < argc) {
       options.queueWeight = std::stod(argv[++i]);
     } else if (arg == "--wait-weight" && i + 1 < argc) {
@@ -321,7 +407,39 @@ Options parseArgs(int argc, char** argv) {
       options.optimizeDelta = std::stod(argv[++i]);
     }
   }
+
+  if (options.minGreen < 0) {
+    options.minGreen = options.phaseDuration;
+  }
+  if (options.maxGreen < 0) {
+    options.maxGreen = std::max(options.minGreen, options.phaseDuration * 2);
+  }
   return options;
+}
+
+std::vector<std::string> loadProgramPhaseStates(const std::string& trafficLightId,
+                                                const std::string& programId) {
+  std::string desiredProgram = programId;
+  if (desiredProgram.empty()) {
+    desiredProgram = libtraci::trafficlight::getProgram(trafficLightId);
+  }
+
+  auto programs = libtraci::trafficlight::getAllProgramLogics(trafficLightId);
+  for (const auto& program : programs) {
+    if (program.programID != desiredProgram) {
+      continue;
+    }
+    std::vector<std::string> phases;
+    phases.reserve(program.phases.size());
+    for (const auto& phase : program.phases) {
+      phases.push_back(phase.state);
+    }
+    return phases;
+  }
+
+  std::cerr << "Program id '" << desiredProgram << "' not found for traffic light "
+            << trafficLightId << ".\n";
+  return {};
 }
 
 class SimpleOptimizer {
@@ -403,13 +521,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto phaseGroups = parsePhaseMap(options.phaseMap);
-  if (phaseGroups.empty()) {
-    std::cerr << "Invalid --phase-map. Provide at least one phase mapping.\n";
-    return 1;
-  }
-  auto phaseGroupsForOptimizer = phaseGroups;
-
   std::vector<std::string> sumoCmd = {options.gui ? "sumo-gui" : "sumo",
                                       "-c",
                                       options.sumoConfig,
@@ -419,10 +530,23 @@ int main(int argc, char** argv) {
 
   libtraci::start(sumoCmd);
 
+  auto programPhases = loadProgramPhaseStates(options.trafficLightId, options.programId);
+  auto phaseGroups = parsePhaseMap(options.phaseMap, programPhases);
+  if (phaseGroups.empty()) {
+    std::cerr << "Invalid --phase-map. Provide at least one phase mapping.\n";
+    libtraci::close();
+    return 1;
+  }
+  auto phaseGroupsForOptimizer = phaseGroups;
+
   AuctionController controller(options.trafficLightId,
                                std::move(phaseGroups),
                                AuctionWeights{options.queueWeight, options.waitWeight},
-                               options.phaseDuration);
+                               PhaseSafetyConstraints{options.minGreen,
+                                                      options.maxGreen,
+                                                      options.yellowDuration,
+                                                      options.allRedDuration},
+                               programPhases);
 
   SimpleOptimizer optimizer(phaseGroupsForOptimizer, options.optimizeWindow, options.optimizeDelta);
   int stepIndex = 0;
