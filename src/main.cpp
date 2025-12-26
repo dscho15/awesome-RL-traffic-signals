@@ -17,6 +17,7 @@ struct Options {
   std::string sumoConfig;
   std::string trafficLightId;
   std::string phaseMap;
+  bool autoPhaseMap = false;
   bool gui = false;
   int stepLength = 1;
   int phaseDuration = 10;
@@ -31,6 +32,7 @@ struct OptionFlags {
   bool sumoConfig = false;
   bool trafficLightId = false;
   bool phaseMap = false;
+  bool autoPhaseMap = false;
   bool gui = false;
   bool stepLength = false;
   bool phaseDuration = false;
@@ -107,6 +109,40 @@ std::vector<PhaseBidGroup> parsePhaseMap(const std::string& mapping) {
   return groups;
 }
 
+bool hasGreenSignal(char signal) {
+  return signal == 'G' || signal == 'g';
+}
+
+std::vector<PhaseBidGroup> buildAutoPhaseMap(const libtraci::TraCILogic& logic) {
+  std::vector<PhaseBidGroup> groups;
+  const auto& connections = logic.connections;
+  if (connections.empty()) {
+    return groups;
+  }
+
+  for (size_t phaseIndex = 0; phaseIndex < logic.phases.size(); ++phaseIndex) {
+    const auto& phase = logic.phases[phaseIndex];
+    std::vector<std::string> lanes;
+    const auto maxIndex = std::min(phase.state.size(), connections.size());
+    for (size_t connectionIndex = 0; connectionIndex < maxIndex; ++connectionIndex) {
+      if (!hasGreenSignal(phase.state[connectionIndex])) {
+        continue;
+      }
+      const auto& connection = connections[connectionIndex];
+      if (!connection.fromLane.empty()) {
+        lanes.push_back(connection.fromLane);
+      }
+    }
+    if (!lanes.empty()) {
+      std::sort(lanes.begin(), lanes.end());
+      lanes.erase(std::unique(lanes.begin(), lanes.end()), lanes.end());
+      groups.push_back(PhaseBidGroup{static_cast<int>(phaseIndex), std::move(lanes)});
+    }
+  }
+
+  return groups;
+}
+
 Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
   Options options;
   std::ifstream file(path);
@@ -147,6 +183,9 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
       } else if (key == "phase_map") {
         options.phaseMap = value;
         flags.phaseMap = true;
+      } else if (key == "auto_phase_map") {
+        options.autoPhaseMap = parseBool(value);
+        flags.autoPhaseMap = true;
       } else if (key == "gui") {
         options.gui = parseBool(value);
         flags.gui = true;
@@ -194,10 +233,12 @@ double computeObjective(const std::vector<PhaseBidGroup>& groups) {
 
 void printUsage() {
   std::cout
-      << "Usage: auction_tsc --sumo-config <cfg.sumocfg> --tl-id <traffic_light_id> --phase-map "
-         "\"0:laneA,laneB;1:laneC,laneD\" [options]\n"
+      << "Usage: auction_tsc --sumo-config <cfg.sumocfg> --tl-id <traffic_light_id> "
+         "[--phase-map \"0:laneA,laneB;1:laneC,laneD\" | --auto-phase-map] [options]\n"
          "Options:\n"
          "  --config <file.yaml>         Load options from a yaml file\n"
+         "  --phase-map <map>            Manual phase-to-lane mapping\n"
+         "  --auto-phase-map             Build phase mapping from SUMO program logic\n"
          "  --gui                       Run with sumo-gui\n"
          "  --step-length <seconds>      Simulation step length (default: 1)\n"
          "  --phase-duration <seconds>   Duration to hold a phase (default: 10)\n"
@@ -218,8 +259,12 @@ bool validateOptions(const Options& options) {
     std::cerr << "Missing required --tl-id.\n";
     ok = false;
   }
-  if (options.phaseMap.empty()) {
-    std::cerr << "Missing required --phase-map.\n";
+  if (options.phaseMap.empty() && !options.autoPhaseMap) {
+    std::cerr << "Missing required --phase-map or --auto-phase-map.\n";
+    ok = false;
+  }
+  if (!options.phaseMap.empty() && options.autoPhaseMap) {
+    std::cerr << "Use either --phase-map or --auto-phase-map, not both.\n";
     ok = false;
   }
   if (options.stepLength <= 0) {
@@ -269,6 +314,9 @@ Options parseArgs(int argc, char** argv) {
     if (yamlFlags.phaseMap) {
       options.phaseMap = yamlOptions.phaseMap;
     }
+    if (yamlFlags.autoPhaseMap) {
+      options.autoPhaseMap = yamlOptions.autoPhaseMap;
+    }
     if (yamlFlags.gui) {
       options.gui = yamlOptions.gui;
     }
@@ -303,6 +351,8 @@ Options parseArgs(int argc, char** argv) {
       options.trafficLightId = argv[++i];
     } else if (arg == "--phase-map" && i + 1 < argc) {
       options.phaseMap = argv[++i];
+    } else if (arg == "--auto-phase-map") {
+      options.autoPhaseMap = true;
     } else if (arg == "--gui") {
       options.gui = true;
     } else if (arg == "--step-length" && i + 1 < argc) {
@@ -403,13 +453,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto phaseGroups = parsePhaseMap(options.phaseMap);
-  if (phaseGroups.empty()) {
-    std::cerr << "Invalid --phase-map. Provide at least one phase mapping.\n";
-    return 1;
-  }
-  auto phaseGroupsForOptimizer = phaseGroups;
-
   std::vector<std::string> sumoCmd = {options.gui ? "sumo-gui" : "sumo",
                                       "-c",
                                       options.sumoConfig,
@@ -418,6 +461,56 @@ int main(int argc, char** argv) {
                                       "--quit-on-end"};
 
   libtraci::start(sumoCmd);
+
+  const auto programLogics =
+      libtraci::trafficlight::getAllProgramLogics(options.trafficLightId);
+  if (programLogics.empty()) {
+    std::cerr << "No program logics found for traffic light " << options.trafficLightId << ".\n";
+    libtraci::close();
+    return 1;
+  }
+
+  const auto activeProgram = libtraci::trafficlight::getProgram(options.trafficLightId);
+  auto selectedLogicIt = std::find_if(programLogics.begin(),
+                                      programLogics.end(),
+                                      [&](const auto& logic) {
+                                        return logic.programID == activeProgram;
+                                      });
+  if (selectedLogicIt == programLogics.end()) {
+    selectedLogicIt = programLogics.begin();
+    std::cerr << "Program '" << activeProgram
+              << "' not found, using first available program logic.\n";
+  }
+  const auto& selectedLogic = *selectedLogicIt;
+
+  std::vector<PhaseBidGroup> phaseGroups;
+  if (options.autoPhaseMap) {
+    phaseGroups = buildAutoPhaseMap(selectedLogic);
+    if (phaseGroups.empty()) {
+      std::cerr << "Auto phase map did not yield any green phases.\n";
+      libtraci::close();
+      return 1;
+    }
+  } else {
+    phaseGroups = parsePhaseMap(options.phaseMap);
+    if (phaseGroups.empty()) {
+      std::cerr << "Invalid --phase-map. Provide at least one phase mapping.\n";
+      libtraci::close();
+      return 1;
+    }
+  }
+
+  const int phaseCount = static_cast<int>(selectedLogic.phases.size());
+  for (const auto& group : phaseGroups) {
+    if (group.phaseIndex < 0 || group.phaseIndex >= phaseCount) {
+      std::cerr << "Phase index " << group.phaseIndex
+                << " is out of range for program '" << selectedLogic.programID << "'.\n";
+      libtraci::close();
+      return 1;
+    }
+  }
+
+  auto phaseGroupsForOptimizer = phaseGroups;
 
   AuctionController controller(options.trafficLightId,
                                std::move(phaseGroups),
