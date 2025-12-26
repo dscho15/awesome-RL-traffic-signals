@@ -22,6 +22,7 @@ struct Options {
   int phaseDuration = 10;
   double queueWeight = 1.0;
   double waitWeight = 0.05;
+  ScoringMode scoringMode = ScoringMode::QueueWait;
   bool optimize = false;
   int optimizeWindow = 60;
   double optimizeDelta = 0.2;
@@ -36,6 +37,7 @@ struct OptionFlags {
   bool phaseDuration = false;
   bool queueWeight = false;
   bool waitWeight = false;
+  bool scoringMode = false;
   bool optimize = false;
   bool optimizeWindow = false;
   bool optimizeDelta = false;
@@ -73,6 +75,30 @@ bool parseBool(const std::string& value) {
   return lowered == "true" || lowered == "1" || lowered == "yes" || lowered == "on";
 }
 
+std::string toLower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return value;
+}
+
+bool parseScoringMode(const std::string& value, ScoringMode& mode) {
+  std::string lowered = toLower(value);
+  if (lowered == "queue_wait" || lowered == "queue-wait" || lowered == "queuewait") {
+    mode = ScoringMode::QueueWait;
+    return true;
+  }
+  if (lowered == "occupancy") {
+    mode = ScoringMode::Occupancy;
+    return true;
+  }
+  if (lowered == "flow") {
+    mode = ScoringMode::Flow;
+    return true;
+  }
+  return false;
+}
+
 std::string stripInlineComment(const std::string& value) {
   bool inQuotes = false;
   for (size_t i = 0; i < value.size(); ++i) {
@@ -98,9 +124,18 @@ std::vector<PhaseBidGroup> parsePhaseMap(const std::string& mapping) {
     }
 
     int phaseIndex = std::stoi(parts[0]);
-    auto lanes = split(parts[1], ',');
-    if (!lanes.empty()) {
-      groups.push_back(PhaseBidGroup{phaseIndex, lanes});
+    std::string laneSection = parts[1];
+    std::string detectorSection;
+    auto delimiterPos = parts[1].find('|');
+    if (delimiterPos != std::string::npos) {
+      laneSection = parts[1].substr(0, delimiterPos);
+      detectorSection = parts[1].substr(delimiterPos + 1);
+    }
+
+    auto lanes = split(laneSection, ',');
+    auto detectors = split(detectorSection, ',');
+    if (!lanes.empty() || !detectors.empty()) {
+      groups.push_back(PhaseBidGroup{phaseIndex, lanes, detectors});
     }
   }
 
@@ -162,6 +197,14 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
       } else if (key == "wait_weight") {
         options.waitWeight = std::stod(value);
         flags.waitWeight = true;
+      } else if (key == "score_mode") {
+        ScoringMode mode = ScoringMode::QueueWait;
+        if (!parseScoringMode(value, mode)) {
+          std::cerr << "Invalid score_mode: " << value << "\n";
+        } else {
+          options.scoringMode = mode;
+          flags.scoringMode = true;
+        }
       } else if (key == "optimize") {
         options.optimize = parseBool(value);
         flags.optimize = true;
@@ -195,7 +238,7 @@ double computeObjective(const std::vector<PhaseBidGroup>& groups) {
 void printUsage() {
   std::cout
       << "Usage: auction_tsc --sumo-config <cfg.sumocfg> --tl-id <traffic_light_id> --phase-map "
-         "\"0:laneA,laneB;1:laneC,laneD\" [options]\n"
+         "\"0:laneA,laneB|detA,detB;1:laneC,laneD\" [options]\n"
          "Options:\n"
          "  --config <file.yaml>         Load options from a yaml file\n"
          "  --gui                       Run with sumo-gui\n"
@@ -203,6 +246,7 @@ void printUsage() {
          "  --phase-duration <seconds>   Duration to hold a phase (default: 10)\n"
          "  --queue-weight <float>       Weight for queue length (default: 1.0)\n"
          "  --wait-weight <float>        Weight for waiting time (default: 0.05)\n"
+         "  --score-mode <mode>          Scoring mode: queue_wait, occupancy, flow\n"
          "  --optimize                   Enable simple weight tuning\n"
          "  --optimize-window <steps>    Steps to evaluate each candidate (default: 60)\n"
          "  --optimize-delta <float>     Weight adjustment step (default: 0.2)\n";
@@ -233,6 +277,19 @@ bool validateOptions(const Options& options) {
   if (options.queueWeight < 0.0 || options.waitWeight < 0.0) {
     std::cerr << "Weights must be non-negative.\n";
     ok = false;
+  }
+  if (options.scoringMode != ScoringMode::QueueWait && options.optimize) {
+    std::cerr << "--optimize is only supported with score_mode queue_wait.\n";
+    ok = false;
+  }
+  if (options.scoringMode == ScoringMode::QueueWait) {
+    for (const auto& group : parsePhaseMap(options.phaseMap)) {
+      if (group.lanes.empty()) {
+        std::cerr << "Queue/wait scoring requires lanes in --phase-map.\n";
+        ok = false;
+        break;
+      }
+    }
   }
   if (options.optimize) {
     if (options.optimizeWindow <= 0) {
@@ -284,6 +341,9 @@ Options parseArgs(int argc, char** argv) {
     if (yamlFlags.waitWeight) {
       options.waitWeight = yamlOptions.waitWeight;
     }
+    if (yamlFlags.scoringMode) {
+      options.scoringMode = yamlOptions.scoringMode;
+    }
     if (yamlFlags.optimize) {
       options.optimize = yamlOptions.optimize;
     }
@@ -313,6 +373,10 @@ Options parseArgs(int argc, char** argv) {
       options.queueWeight = std::stod(argv[++i]);
     } else if (arg == "--wait-weight" && i + 1 < argc) {
       options.waitWeight = std::stod(argv[++i]);
+    } else if (arg == "--score-mode" && i + 1 < argc) {
+      if (!parseScoringMode(argv[++i], options.scoringMode)) {
+        std::cerr << "Invalid --score-mode. Use queue_wait, occupancy, or flow.\n";
+      }
     } else if (arg == "--optimize") {
       options.optimize = true;
     } else if (arg == "--optimize-window" && i + 1 < argc) {
@@ -422,6 +486,7 @@ int main(int argc, char** argv) {
   AuctionController controller(options.trafficLightId,
                                std::move(phaseGroups),
                                AuctionWeights{options.queueWeight, options.waitWeight},
+                               options.scoringMode,
                                options.phaseDuration);
 
   SimpleOptimizer optimizer(phaseGroupsForOptimizer, options.optimizeWindow, options.optimizeDelta);
