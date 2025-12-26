@@ -17,6 +17,7 @@ struct Options {
   std::string sumoConfig;
   std::string trafficLightId;
   std::string phaseMap;
+  std::string metricsOutput;
   bool gui = false;
   int stepLength = 1;
   int phaseDuration = 10;
@@ -31,6 +32,7 @@ struct OptionFlags {
   bool sumoConfig = false;
   bool trafficLightId = false;
   bool phaseMap = false;
+  bool metricsOutput = false;
   bool gui = false;
   bool stepLength = false;
   bool phaseDuration = false;
@@ -107,6 +109,16 @@ std::vector<PhaseBidGroup> parsePhaseMap(const std::string& mapping) {
   return groups;
 }
 
+std::vector<std::string> collectLaneIds(const std::vector<PhaseBidGroup>& groups) {
+  std::vector<std::string> lanes;
+  for (const auto& group : groups) {
+    lanes.insert(lanes.end(), group.lanes.begin(), group.lanes.end());
+  }
+  std::sort(lanes.begin(), lanes.end());
+  lanes.erase(std::unique(lanes.begin(), lanes.end()), lanes.end());
+  return lanes;
+}
+
 Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
   Options options;
   std::ifstream file(path);
@@ -147,6 +159,9 @@ Options loadYamlConfig(const std::string& path, OptionFlags& flags) {
       } else if (key == "phase_map") {
         options.phaseMap = value;
         flags.phaseMap = true;
+      } else if (key == "metrics_output") {
+        options.metricsOutput = value;
+        flags.metricsOutput = true;
       } else if (key == "gui") {
         options.gui = parseBool(value);
         flags.gui = true;
@@ -198,6 +213,7 @@ void printUsage() {
          "\"0:laneA,laneB;1:laneC,laneD\" [options]\n"
          "Options:\n"
          "  --config <file.yaml>         Load options from a yaml file\n"
+         "  --metrics-output <file.csv>  Write step metrics to a CSV file\n"
          "  --gui                       Run with sumo-gui\n"
          "  --step-length <seconds>      Simulation step length (default: 1)\n"
          "  --phase-duration <seconds>   Duration to hold a phase (default: 10)\n"
@@ -269,6 +285,9 @@ Options parseArgs(int argc, char** argv) {
     if (yamlFlags.phaseMap) {
       options.phaseMap = yamlOptions.phaseMap;
     }
+    if (yamlFlags.metricsOutput) {
+      options.metricsOutput = yamlOptions.metricsOutput;
+    }
     if (yamlFlags.gui) {
       options.gui = yamlOptions.gui;
     }
@@ -303,6 +322,8 @@ Options parseArgs(int argc, char** argv) {
       options.trafficLightId = argv[++i];
     } else if (arg == "--phase-map" && i + 1 < argc) {
       options.phaseMap = argv[++i];
+    } else if (arg == "--metrics-output" && i + 1 < argc) {
+      options.metricsOutput = argv[++i];
     } else if (arg == "--gui") {
       options.gui = true;
     } else if (arg == "--step-length" && i + 1 < argc) {
@@ -409,6 +430,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   auto phaseGroupsForOptimizer = phaseGroups;
+  auto laneIds = collectLaneIds(phaseGroupsForOptimizer);
 
   std::vector<std::string> sumoCmd = {options.gui ? "sumo-gui" : "sumo",
                                       "-c",
@@ -418,6 +440,16 @@ int main(int argc, char** argv) {
                                       "--quit-on-end"};
 
   libtraci::start(sumoCmd);
+
+  std::ofstream metricsStream;
+  if (!options.metricsOutput.empty()) {
+    metricsStream.open(options.metricsOutput);
+    if (!metricsStream) {
+      std::cerr << "Failed to open metrics output file: " << options.metricsOutput << "\n";
+      return 1;
+    }
+    metricsStream << "step,time,total_waiting_time,total_queue_length,arrived,departed\n";
+  }
 
   AuctionController controller(options.trafficLightId,
                                std::move(phaseGroups),
@@ -437,9 +469,24 @@ int main(int argc, char** argv) {
       optimizer.step(stepIndex, controller);
     }
     controller.applyPhaseIfDue(currentTime);
+    if (metricsStream) {
+      double totalWaiting = 0.0;
+      int totalQueue = 0;
+      for (const auto& laneId : laneIds) {
+        totalWaiting += libtraci::lane::getWaitingTime(laneId);
+        totalQueue += libtraci::lane::getLastStepVehicleNumber(laneId);
+      }
+      int arrived = libtraci::simulation::getArrivedNumber();
+      int departed = libtraci::simulation::getDepartedNumber();
+      metricsStream << stepIndex << "," << currentTime << "," << totalWaiting << ","
+                    << totalQueue << "," << arrived << "," << departed << "\n";
+    }
     ++stepIndex;
   }
 
+  if (metricsStream) {
+    metricsStream.flush();
+  }
   libtraci::close();
   return 0;
 }
